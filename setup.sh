@@ -15,8 +15,8 @@ readonly NC='\033[0m' # No Color
 # shellcheck disable=SC2059
 
 # Docker Compose Constants
-readonly INFLUXDB_PORT=8181
-readonly EXPLORER_PORT=8888
+INFLUXDB_PORT=8181  # Can be changed if port is in use
+EXPLORER_PORT=8888  # Can be changed if port is in use
 readonly EXPLORER_IMAGE="influxdata/influxdb3-ui:1.4.0"
 readonly DEFAULT_DATABASE="mydb"
 readonly MANUAL_TOKEN_MSG="MANUAL_TOKEN_CREATION_REQUIRED"
@@ -107,6 +107,51 @@ check_docker() {
         return 1
     fi
     return 0
+}
+
+# Function to find available ports for InfluxDB and Explorer
+find_available_ports() {
+    show_progress="${1:-true}"
+
+    lsof_exec=$(command -v lsof)
+    if [ -z "$lsof_exec" ]; then
+        # lsof not available, skip port checking
+        return 0
+    fi
+
+    # Check InfluxDB port
+    ORIGINAL_INFLUXDB_PORT=$INFLUXDB_PORT
+    while lsof -i:"$INFLUXDB_PORT" -t >/dev/null 2>&1; do
+        if [ "$show_progress" = "true" ]; then
+            printf "├─${DIM} Port %s is in use. Finding new port.${NC}\n" "$INFLUXDB_PORT"
+        fi
+        INFLUXDB_PORT=$((INFLUXDB_PORT + 1))
+        if [ "$INFLUXDB_PORT" -gt 32767 ]; then
+            printf "└─${RED} Could not find an available port for InfluxDB. Aborting.${NC}\n"
+            exit 1
+        fi
+    done
+
+    if [ "$INFLUXDB_PORT" != "$ORIGINAL_INFLUXDB_PORT" ] && [ "$show_progress" = "true" ]; then
+        printf "├─${DIM} Found available InfluxDB port: %s${NC}\n" "$INFLUXDB_PORT"
+    fi
+
+    # Check Explorer port
+    ORIGINAL_EXPLORER_PORT=$EXPLORER_PORT
+    while lsof -i:"$EXPLORER_PORT" -t >/dev/null 2>&1; do
+        if [ "$show_progress" = "true" ]; then
+            printf "├─${DIM} Port %s is in use. Finding new port.${NC}\n" "$EXPLORER_PORT"
+        fi
+        EXPLORER_PORT=$((EXPLORER_PORT + 1))
+        if [ "$EXPLORER_PORT" -gt 32767 ]; then
+            printf "└─${RED} Could not find an available port for Explorer. Aborting.${NC}\n"
+            exit 1
+        fi
+    done
+
+    if [ "$EXPLORER_PORT" != "$ORIGINAL_EXPLORER_PORT" ] && [ "$show_progress" = "true" ]; then
+        printf "├─${DIM} Found available Explorer port: %s${NC}\n" "$EXPLORER_PORT"
+    fi
 }
 
 # Utility function to filter Docker Compose output
@@ -208,9 +253,22 @@ wait_for_explorer_ready() {
 create_operator_token() {
     CONTAINER_NAME="$1"
 
-    # Try API first
-    TOKEN_RESPONSE=$(curl -s -X POST http://localhost:$INFLUXDB_PORT/api/v3/configure/token/admin 2>&1)
-    TOKEN=$(echo "$TOKEN_RESPONSE" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+    # Try API first with retries
+    MAX_RETRIES=3
+    RETRY=0
+    TOKEN=""
+
+    while [ $RETRY -lt $MAX_RETRIES ] && [ -z "$TOKEN" ]; do
+        TOKEN_RESPONSE=$(curl -s -m 5 -X POST http://localhost:$INFLUXDB_PORT/api/v3/configure/token/admin 2>&1)
+        TOKEN=$(echo "$TOKEN_RESPONSE" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+
+        if [ -z "$TOKEN" ] && [ $RETRY -lt $((MAX_RETRIES - 1)) ]; then
+            sleep 2
+            RETRY=$((RETRY + 1))
+        else
+            break
+        fi
+    done
 
     # Fallback to CLI if API fails
     if [ -z "$TOKEN" ]; then
@@ -291,7 +349,7 @@ services:
     image: ${IMAGE_NAME}
     container_name: ${SERVICE_NAME}
     ports:
-      - "${INFLUXDB_PORT}:${INFLUXDB_PORT}"
+      - "${INFLUXDB_PORT}:8181"
     command:
       - influxdb3
       - serve
@@ -422,6 +480,9 @@ setup_docker_compose() {
     printf "├─ Creating directories...\n"
     create_docker_directories "$DOCKER_DIR"
 
+    # Check for available ports
+    find_available_ports
+
     # Generate session secret
     SESSION_SECRET=$(generate_session_secret)
 
@@ -452,8 +513,8 @@ setup_docker_compose() {
     if [ "$TOKEN" != "$MANUAL_TOKEN_MSG" ]; then
         printf "├─${GREEN} Token created successfully${NC}\n"
 
-        # Configure Explorer
-        configure_explorer_via_file "$TOKEN" "http://${CONTAINER_NAME}:${INFLUXDB_PORT}" "$SERVER_NAME" "$DOCKER_DIR"
+        # Configure Explorer (use port 8181 for container-to-container communication)
+        configure_explorer_via_file "$TOKEN" "http://${CONTAINER_NAME}:8181" "$SERVER_NAME" "$DOCKER_DIR"
         docker compose up -d influxdb3-explorer 2>&1 | filter_docker_output
 
         # Wait for Explorer to be ready

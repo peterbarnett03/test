@@ -547,6 +547,22 @@ EOF
     return 0
 }
 
+# Utility function to extract existing token from Explorer config
+extract_token_from_explorer_config() {
+    DOCKER_DIR="$1"
+    CONFIG_FILE="$DOCKER_DIR/explorer/config/config.json"
+
+    if [ -f "$CONFIG_FILE" ]; then
+        TOKEN=$(grep '"DEFAULT_API_TOKEN"' "$CONFIG_FILE" | cut -d'"' -f4)
+        if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then
+            echo "$TOKEN"
+            return 0
+        fi
+    fi
+    echo ""
+    return 1
+}
+
 # Unified function to setup Docker Compose (both Core and Enterprise)
 setup_docker_compose() {
     EDITION_TYPE="$1"  # "core" or "enterprise"
@@ -582,8 +598,8 @@ setup_docker_compose() {
 
     # Enterprise-specific: Handle license prompting
     if [ "$EDITION_TYPE" = "enterprise" ]; then
-        # Check for existing license
-        if [ -d "$DOCKER_DIR/influxdb3/data/cluster0" ] && [ -f "$DOCKER_DIR/influxdb3/data/cluster0/trial_or_home_license" ]; then
+        # Check for existing license in shared data directory
+        if [ -f "$HOME/.influxdb/data/cluster0/trial_or_home_license" ]; then
             printf "├─${DIM} Found existing license file${NC}\n"
         elif [ -z "$LICENSE_EMAIL" ]; then
             # Prompt for license if not provided
@@ -611,6 +627,14 @@ setup_docker_compose() {
     printf "├─ Creating directories\n"
     create_docker_directories "$DOCKER_DIR"
 
+    # Stop any existing containers before reconfiguring
+    if [ -f "$DOCKER_DIR/docker-compose.yml" ]; then
+        printf "├─ Stopping existing containers\n"
+        cd "$DOCKER_DIR"
+        docker compose down 2>/dev/null || true
+        cd - > /dev/null
+    fi
+
     # Check for available ports
     INFLUXDB_PORT=$(find_next_available_port "$INFLUXDB_PORT")
     EXPLORER_PORT=$(find_next_available_port "$EXPLORER_PORT")
@@ -637,16 +661,38 @@ setup_docker_compose() {
 
     sleep 2
 
-    # Create operator token
-    printf "└─ Creating operator token\n\n"
-    TOKEN=$(create_operator_token "$CONTAINER_NAME")
+    # Check for existing token in Explorer config, or create new one
+    CONFIG_FILE="$DOCKER_DIR/explorer/config/config.json"
+    TOKEN_IS_NEW=false
 
-    # Display token BEFORE launching Explorer
+    if [ -f "$CONFIG_FILE" ]; then
+        printf "└─ Found existing Explorer config\n\n"
+        TOKEN=$(extract_token_from_explorer_config "$DOCKER_DIR")
+
+        if [ -n "$TOKEN" ]; then
+            TOKEN_IS_NEW=false
+        else
+            printf "   ${YELLOW}Config exists but no valid token found${NC}\n"
+            printf "   Creating new operator token\n"
+            TOKEN=$(create_operator_token "$CONTAINER_NAME")
+            TOKEN_IS_NEW=true
+            printf "\n"
+        fi
+    else
+        printf "└─ Creating operator token\n"
+        TOKEN=$(create_operator_token "$CONTAINER_NAME")
+        TOKEN_IS_NEW=true
+        printf "\n"
+    fi
+
+    # Display token BEFORE launching Explorer (only if newly created)
     if [ "$TOKEN" != "$MANUAL_TOKEN_MSG" ]; then
-        printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n"
-        printf "${BOLD}OPERATOR TOKEN: Save this token. It will not be shown again.${NC}\n"
-        printf "%s\n" "$TOKEN"
-        printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n\n"
+        if [ "$TOKEN_IS_NEW" = true ]; then
+            printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n"
+            printf "${BOLD}OPERATOR TOKEN: Save this token. It will not be shown again.${NC}\n"
+            printf "%s\n" "$TOKEN"
+            printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n\n"
+        fi
 
         # Now launch Explorer after showing the token
         printf "${BOLD}Setting up InfluxDB 3 Explorer...${NC}\n"
@@ -1024,58 +1070,7 @@ case "$INSTALL_TYPE" in
         
         # Set default installation directory
         DOCKER_DIR="$HOME/.influxdb/docker"
-        
-        # Check if directory exists
-        if [ -d "$DOCKER_DIR" ] && [ -f "$DOCKER_DIR/docker-compose.yml" ]; then
-            printf "\n${YELLOW}Notice:${NC} Existing installation found at %s\n\n" "$DOCKER_DIR"
-            printf "${BOLD}Updating to latest images...${NC}\n"
 
-            cd "$DOCKER_DIR"
-
-            # Detect which InfluxDB service is in the compose file
-            if grep -q "influxdb3-enterprise:" docker-compose.yml; then
-                INFLUXDB_SERVICE="influxdb3-enterprise"
-                EDITION_NAME="Enterprise"
-            else
-                INFLUXDB_SERVICE="influxdb3-core"
-                EDITION_NAME="Core"
-            fi
-
-            # Use existing ports or defaults
-            INFLUXDB_PORT="${EXISTING_INFLUXDB_PORT:-8181}"
-            EXPLORER_PORT="${EXISTING_EXPLORER_PORT:-8888}"
-
-            # Pull latest images
-            pull_docker_image "$INFLUXDB_SERVICE" "InfluxDB 3 ${EDITION_NAME}" "false"
-            pull_docker_image "influxdb3-explorer" "InfluxDB 3 Explorer" "false"
-
-            # Restart with new images
-            printf "├─ Stopping containers\n"
-            docker compose down 2>/dev/null || true
-
-            docker compose up -d "$INFLUXDB_SERVICE" 2>&1 | filter_docker_output
-
-            # Wait for InfluxDB to be ready
-            if ! wait_for_container_ready "$INFLUXDB_SERVICE" "startup time:" 60 "" ""; then
-                printf "\n${RED}Error: InfluxDB failed to start${NC}\n"
-                exit 1
-            fi
-
-            docker compose up -d influxdb3-explorer 2>&1 | filter_docker_output
-
-            # Wait for Explorer to be ready
-            if wait_for_explorer_ready 60; then
-                open_browser_url "http://localhost:${EXPLORER_PORT}/system-overview"
-            fi
-            printf "\n"
-
-            printf "${BOLDGREEN}✓ InfluxDB 3 %s with Explorer updated successfully${NC}\n\n" "$EDITION_NAME"
-            printf "${BOLD}Access Points:${NC}\n"
-            printf "├─ Explorer UI:  ${BLUE}http://localhost:${EXPLORER_PORT}${NC}\n"
-            printf "└─ InfluxDB API: ${BLUE}http://localhost:${INFLUXDB_PORT}${NC}\n\n"
-            exit 0
-        fi
-        
         # Run appropriate setup based on edition
         if [ "$EDITION" = "Enterprise" ]; then
             setup_docker_compose "enterprise" "$DOCKER_DIR"

@@ -1,5 +1,138 @@
 #!/bin/sh -e
 
+################################################################################
+# InfluxDB 3 Installation Script
+################################################################################
+#
+# PURPOSE:
+#   Automated setup script for InfluxDB 3 with intelligent installation method
+#   selection and environment-aware configuration management. This script is 
+#   designed to be run for quick installation and non-production evaluation.
+#
+# INSTALLATION METHODS:
+#   1. Docker Compose: Complete stack (InfluxDB + Explorer UI)
+#      - Installs latest Docker images
+#      - Auto-creates docker-compose.yml with proper networking
+#      - Manages Explorer configuration and session secrets
+#      - Supports upgrades of existing Docker installations
+#
+#   2. Binary Installation: Direct binary download with optional startup
+#      - Downloads precompiled binaries for supported architectures
+#      - Extracts to user home directory (~/.influxdb)
+#      - Auto-configures shell PATH environment
+#      - Offers Quick Start, Custom, or Install-Only modes
+#
+# DIRECTORY STRUCTURE:
+#   Shared data directory (both installation methods):
+#     ~/.influxdb/
+#       ├── data/                  (Database files - shared between Docker & Binary)
+#       └── plugins/               (Custom plugins - shared between Docker & Binary)
+#
+#   Docker Compose specific:
+#     ~/.influxdb/docker/
+#       ├── docker-compose.yml     (Docker service definitions)
+#       ├── .env                   (Environment variables)
+#       └── explorer/
+#           ├── db/                (Explorer database)
+#           └── config/            (Explorer configuration)
+#
+#   Binary specific:
+#     ~/.influxdb/
+#       ├── influxdb3              (Main binary)
+#       └── logs/                  (Timestamped server logs)
+#
+# REQUIREMENTS/PREREQUISITES:
+#   Core Requirements:
+#     - POSIX-compliant shell (sh or bash)
+#     - curl (for downloading binaries and verification)
+#     - tar (for extracting archives)
+#     - OpenSSL or similar (for SHA256 verification)
+#
+#   Docker Compose Method:
+#     - Docker engine must be running and responding
+#     - docker and docker compose commands available
+#
+#   Binary Method:
+#     - Supported OS: macOS (ARM64 only), Linux (x86_64 or ARM64)
+#     - Port availability (default 8181, auto-adjusts if in use)
+#
+# EXISTING INSTALLATION HANDLING:
+#   Docker Compose:
+#     - Detects existing docker-compose.yml at ~/.influxdb/docker/
+#     - Automatically upgrades in-place when detected
+#     - Extracts and reuses existing port configuration from .env
+#     - Pulls latest images and restarts containers with health checks
+#     - Preserves all data in bind-mounted directories
+#
+#   Binary:
+#     - Overwrites any existing binary at ~/.influxdb/influxdb3
+#     - Preserves data directory (~/.influxdb/data) automatically
+#     - User can run script repeatedly to upgrade to latest version
+#
+# CONFIGURATION OPTIONS:
+#   Command Line Arguments:
+#     [enterprise]        Install Enterprise edition (default: Core)
+#     --version VERSION   Specify InfluxDB version (default: 3.6.0)
+#
+#   Interactive Prompts (Binary Installation):
+#     Installation Type:  Docker Compose or Binary
+#     Startup Mode:       Quick Start, Custom, or Skip
+#     Node ID:            Identifier for this server instance
+#     Cluster ID:         (Enterprise only) Cluster identifier
+#     Storage Type:       File, S3, Azure, GCS, or Memory
+#     Cloud Credentials:  (If object storage selected)
+#     License Type:       (Enterprise only) Trial or Home
+#     License Email:      (Enterprise only) Email for activation
+#
+#   Docker Compose Specific:
+#     Port Selection:     Automatic via find_next_available_port()
+#     Session Secret:     Generated via openssl or date hash
+#     InfluxDB Port:      Default 8181 (mapped to container 8181)
+#     Explorer Port:      Default 8888 (mapped to container 80)
+#     Container Restart:  unless-stopped policy
+#
+# EXIT POINTS AND CONDITIONS:
+#   Successful Exits (exit 0):
+#     - Docker Compose: After successful deployment with access points shown
+#     - Docker Upgrade: After successful image pull and container restart
+#     - Binary: After showing "Next Steps" information
+#     - Skip Startup: After installation without starting service
+#
+#   Error Exits (exit 1):
+#     - Unsupported OS/Architecture (Intel Mac, Windows, etc.)
+#     - Docker not running or unavailable (Docker Compose path)
+#     - Failed image pulls or docker compose commands
+#     - Failed binary download, signature verification, or extraction
+#     - Invalid SHA256 checksum on downloaded binary
+#     - Container startup timeout (>60 seconds for InfluxDB/Explorer)
+#     - Port allocation failure or port range exhausted
+#
+# SPECIAL BEHAVIORS:
+#   Binary Download:
+#     - URL format: https://dl.influxdata.com/influxdb/releases/
+#       influxdb3-{edition_tag}-{version}_{artifact}.tar.gz
+#     - Downloads corresponding .sha256 file for verification
+#     - Validates checksums before extraction
+#     - Automatically adds installation path to shell rc file
+#
+#   Docker Compose:
+#     - Creates internal network (influxdb-network) for service communication
+#     - Configures Explorer to communicate via container name internally
+#     - Opens Explorer UI in default browser upon successful startup
+#     - Filters verbose docker compose output for cleaner display
+#
+#   Health Checking:
+#     - InfluxDB (Docker): Waits for "startup time:" in container logs
+#     - Explorer: Polls /api/health endpoint for "ok/status/healthy"
+#
+# SHELL EXECUTION CONTEXT:
+#   - Runs with `sh -e` (error exit on command failure)
+#   - Uses POSIX-compatible syntax for maximum portability
+#   - Disables shellcheck SC2059 for printf variable interpolation
+#   - Exports INFLUXDB3_SERVE_INVOCATION_METHOD for telemetry tracking
+#
+################################################################################
+
 # ==========================Script Config==========================
 
 readonly GREEN='\033[0;32m'
@@ -17,8 +150,7 @@ readonly NC='\033[0m' # No Color
 # Docker Compose Constants
 INFLUXDB_PORT=8181  # Can be changed if port is in use
 EXPLORER_PORT=8888  # Can be changed if port is in use
-readonly EXPLORER_IMAGE="influxdata/influxdb3-ui:1.4.0"
-readonly DEFAULT_DATABASE="mydb"
+readonly EXPLORER_IMAGE="influxdata/influxdb3-ui"
 readonly MANUAL_TOKEN_MSG="MANUAL_TOKEN_CREATION_REQUIRED"
 readonly DOCKER_OUTPUT_FILTER='grep -v "version.*obsolete" | grep -v "Creating$" | grep -v "Created$" | grep -v "Starting$" | grep -v "Started$" | grep -v "Running$"'
 
@@ -110,43 +242,59 @@ check_docker() {
 }
 
 # Function to find available ports for InfluxDB and Explorer
-find_available_ports() {
-    show_progress="${1:-true}"
+# Find next available port starting from given port
+# Parameters: $1 - starting_port (e.g., 8181)
+# Returns: Available port number (echoes to stdout)
+# Exits: 1 if port range exhausted (>32767)
+find_next_available_port() {
+    current_port="$1"
 
     lsof_exec=$(command -v lsof)
     if [ -z "$lsof_exec" ]; then
-        # lsof not available, skip port checking
+        echo "$current_port"
         return 0
     fi
 
-    # Check InfluxDB port
-    ORIGINAL_INFLUXDB_PORT=$INFLUXDB_PORT
-    while lsof -i:"$INFLUXDB_PORT" -t >/dev/null 2>&1; do
-        INFLUXDB_PORT=$((INFLUXDB_PORT + 1))
-        if [ "$INFLUXDB_PORT" -gt 32767 ]; then
-            printf "└─${RED} Could not find an available port for InfluxDB. Aborting.${NC}\n"
+    while "$lsof_exec" -i:"$current_port" -t >/dev/null 2>&1; do
+        printf "├─${DIM} Port %s is in use. Finding new port.${NC}\n" "$current_port"
+        current_port=$((current_port + 1))
+        if [ "$current_port" -gt 32767 ]; then
+            printf "└─${RED} Could not find an available port. Aborting.${NC}\n"
             exit 1
         fi
     done
 
-    # Only show if port changed
-    if [ "$INFLUXDB_PORT" != "$ORIGINAL_INFLUXDB_PORT" ] && [ "$show_progress" = "true" ]; then
-        printf "├─${DIM} Using port %s for InfluxDB (default %s in use)${NC}\n" "$INFLUXDB_PORT" "$ORIGINAL_INFLUXDB_PORT"
-    fi
+    echo "$current_port"
+}
 
-    # Check Explorer port
-    ORIGINAL_EXPLORER_PORT=$EXPLORER_PORT
-    while lsof -i:"$EXPLORER_PORT" -t >/dev/null 2>&1; do
-        EXPLORER_PORT=$((EXPLORER_PORT + 1))
-        if [ "$EXPLORER_PORT" -gt 32767 ]; then
-            printf "└─${RED} Could not find an available port for Explorer. Aborting.${NC}\n"
-            exit 1
+# Pull Docker Compose image with configurable error handling
+# Parameters:
+#   $1 - service_name: Docker Compose service name to pull
+#   $2 - display_name: Human-readable name for progress messages
+#   $3 - is_fatal: "true" if failure should abort, "false" to continue (default: false)
+# Returns: 0 on success or non-fatal failure, 1 on fatal failure
+pull_docker_image() {
+    service_name="$1"
+    display_name="$2"
+    is_fatal="${3:-false}"
+
+    printf "├─ Pulling %s image..." "$display_name"
+
+    if docker compose pull "$service_name" >/dev/null 2>&1; then
+        printf "SUCCESS\n"
+        return 0
+    else
+        if [ "$is_fatal" = "true" ]; then
+            printf "${RED}FAILED${NC}\n"
+            printf "└─ ${RED}Error: Failed to pull %s image${NC}\n" "$display_name"
+            printf "   Check your internet connection and Docker Hub access\n\n"
+            return 1
+        else
+            printf "${YELLOW}FAILED${NC}\n"
+            printf "│  ${YELLOW}Warning: %s will not be available${NC}\n" "$display_name"
+            printf "│  You can run this script again later to install it\n"
+            return 0
         fi
-    done
-
-    # Only show if port changed
-    if [ "$EXPLORER_PORT" != "$ORIGINAL_EXPLORER_PORT" ] && [ "$show_progress" = "true" ]; then
-        printf "├─${DIM} Using port %s for Explorer (default %s in use)${NC}\n" "$EXPLORER_PORT" "$ORIGINAL_EXPLORER_PORT"
     fi
 }
 
@@ -200,7 +348,6 @@ wait_for_container_ready() {
     while [ $ELAPSED -lt $TIMEOUT ]; do
         if docker logs "$CONTAINER_NAME" 2>&1 | grep -q "$READY_MESSAGE"; then
             printf "${NC}\n"
-            printf "├─${GREEN} InfluxDB is ready${NC}\n"
             return 0
         fi
 
@@ -237,7 +384,7 @@ wait_for_container_ready() {
 wait_for_explorer_ready() {
     TIMEOUT="${1:-60}"
 
-    printf "├─ Starting Explorer"
+    printf "└─ Starting Explorer"
     ELAPSED=0
 
     while [ $ELAPSED -lt $TIMEOUT ]; do
@@ -245,7 +392,6 @@ wait_for_explorer_ready() {
             API_RESPONSE=$(curl -s http://localhost:$EXPLORER_PORT/api/health 2>&1)
             if echo "$API_RESPONSE" | grep -q "ok\|status\|healthy" 2>/dev/null; then
                 printf "${NC}\n"
-                printf "├─${GREEN} Explorer is ready${NC}\n"
                 return 0
             fi
         fi
@@ -294,105 +440,6 @@ create_operator_token() {
     return 0
 }
 
-# Function to detect existing InfluxDB 3 installations
-detect_existing_installations() {
-    # Initialize detection variables
-    BINARY_FOUND=false
-    DOCKER_FOUND=false
-    BINARY_RUNNING=false
-    DOCKER_RUNNING=false
-    BINARY_IN_PATH=false
-    BINARY_VERSION=""
-    BINARY_PATH_LOCATION=""
-    BINARY_PID=""
-    BINARY_DATA_SIZE=""
-    DOCKER_DATA_SIZE=""
-
-    # Check for binary installation
-    if [ -f "$INSTALL_LOC/influxdb3" ]; then
-        BINARY_FOUND=true
-        # Try to get version
-        BINARY_VERSION=$("$INSTALL_LOC/influxdb3" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    fi
-
-    # Check if binary is in PATH (anywhere)
-    if command -v influxdb3 >/dev/null 2>&1; then
-        BINARY_IN_PATH=true
-        BINARY_PATH_LOCATION=$(command -v influxdb3 2>/dev/null)
-    fi
-
-    # Check for running binary process
-    if command -v pgrep >/dev/null 2>&1; then
-        if pgrep -x influxdb3 >/dev/null 2>&1; then
-            BINARY_RUNNING=true
-            BINARY_PID=$(pgrep -x influxdb3 | head -1)
-        fi
-    fi
-
-    # Check for binary data directory
-    if [ -d "$INSTALL_LOC/data" ]; then
-        if command -v du >/dev/null 2>&1; then
-            BINARY_DATA_SIZE=$(du -sh "$INSTALL_LOC/data" 2>/dev/null | cut -f1)
-        fi
-    fi
-
-    # Set default Docker directory if not set
-    DOCKER_DIR_CHECK="${DOCKER_DIR:-$HOME/.influxdb/docker}"
-
-    # Check for Docker installation
-    if [ -d "$DOCKER_DIR_CHECK" ] && [ -f "$DOCKER_DIR_CHECK/docker-compose.yml" ]; then
-        DOCKER_FOUND=true
-    fi
-
-    # Check for running Docker containers (only if Docker is available)
-    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-        if docker ps --filter "name=influxdb3-core" --format "{{.Names}}" 2>/dev/null | grep -q influxdb3 || \
-           docker ps --filter "name=influxdb3-enterprise" --format "{{.Names}}" 2>/dev/null | grep -q influxdb3; then
-            DOCKER_RUNNING=true
-        fi
-    fi
-
-    # Check for Docker data directory
-    if [ -d "$DOCKER_DIR_CHECK/influxdb3/data" ]; then
-        if command -v du >/dev/null 2>&1; then
-            DOCKER_DATA_SIZE=$(du -sh "$DOCKER_DIR_CHECK/influxdb3/data" 2>/dev/null | cut -f1)
-        fi
-    fi
-}
-
-# Function to display existing installation status
-display_installation_status() {
-    # Only display if something was found
-    if [ "$BINARY_FOUND" = true ] || [ "$DOCKER_FOUND" = true ]; then
-        printf "\n"
-        printf "Found existing: "
-
-        FOUND_ITEMS=""
-
-        if [ "$BINARY_FOUND" = true ]; then
-            if [ "$BINARY_RUNNING" = true ]; then
-                FOUND_ITEMS="Binary (running)"
-            else
-                FOUND_ITEMS="Binary (stopped)"
-            fi
-        fi
-
-        if [ "$DOCKER_FOUND" = true ]; then
-            if [ -n "$FOUND_ITEMS" ]; then
-                FOUND_ITEMS="$FOUND_ITEMS, "
-            fi
-            if [ "$DOCKER_RUNNING" = true ]; then
-                FOUND_ITEMS="${FOUND_ITEMS}Docker (running)"
-            else
-                FOUND_ITEMS="${FOUND_ITEMS}Docker (stopped)"
-            fi
-        fi
-
-        printf "%s${NC}\n" "$FOUND_ITEMS"
-        echo
-    fi
-}
-
 # Function to generate Docker Compose YAML
 generate_docker_compose_yaml() {
     EDITION_TYPE="$1"  # "core" or "enterprise"
@@ -431,8 +478,8 @@ ${CLUSTER_ARG}}
       - --plugin-dir=/var/lib/influxdb3/plugins${ENV_SECTION:+
 ${ENV_SECTION}}
     volumes:
-      - ./influxdb3/data:/var/lib/influxdb3/data
-      - ./influxdb3/plugins:/var/lib/influxdb3/plugins
+      - ~/.influxdb/data:/var/lib/influxdb3/data
+      - ~/.influxdb/plugins:/var/lib/influxdb3/plugins
     restart: unless-stopped
     networks:
       - influxdb-network
@@ -518,7 +565,7 @@ setup_docker_compose() {
         SERVER_NAME="InfluxDB 3 Core"
     fi
 
-    printf "\n${BOLD}Setting up Docker Compose for InfluxDB 3 ${EDITION_NAME}${NC}\n"
+    printf "\n${BOLD}Setting up InfluxDB 3 ${EDITION_NAME}${NC}\n"
 
     # Verify Docker is running before doing any setup work (silent check)
     if ! check_docker; then
@@ -543,7 +590,7 @@ setup_docker_compose() {
             printf "\n${BOLD}License Setup Required${NC}\n"
             printf "1) ${GREEN}Trial${NC} ${DIM}- Full features for 30 days (up to 256 cores)${NC}\n"
             printf "2) ${GREEN}Home${NC} ${DIM}- Free for non-commercial use (max 2 cores, single node)${NC}\n"
-            printf "\nEnter choice (1-2): "
+            printf "\nEnter your choice (1-2): "
             read -r LICENSE_CHOICE
 
             case "${LICENSE_CHOICE:-1}" in
@@ -565,7 +612,8 @@ setup_docker_compose() {
     create_docker_directories "$DOCKER_DIR"
 
     # Check for available ports
-    find_available_ports
+    INFLUXDB_PORT=$(find_next_available_port "$INFLUXDB_PORT")
+    EXPLORER_PORT=$(find_next_available_port "$EXPLORER_PORT")
 
     # Generate session secret
     SESSION_SECRET=$(generate_session_secret)
@@ -576,13 +624,7 @@ setup_docker_compose() {
     cd "$DOCKER_DIR"
 
     # Pull InfluxDB image
-    printf "├─ Pulling InfluxDB 3 ${EDITION_NAME} image\n"
-    if docker compose pull "$CONTAINER_NAME" >/dev/null 2>&1; then
-        printf "│  ${GREEN}Downloaded successfully${NC}\n"
-    else
-        printf "│  ${RED}Failed to download${NC}\n"
-        printf "└─ ${RED}Error: Failed to pull InfluxDB image${NC}\n"
-        printf "   Check your internet connection and Docker Hub access\n\n"
+    if ! pull_docker_image "$CONTAINER_NAME" "InfluxDB 3 ${EDITION_NAME}" "true"; then
         return 1
     fi
 
@@ -596,32 +638,21 @@ setup_docker_compose() {
     sleep 2
 
     # Create operator token
-    printf "├─ Creating operator token\n"
+    printf "└─ Creating operator token\n\n"
     TOKEN=$(create_operator_token "$CONTAINER_NAME")
-
-    printf "└─${GREEN} Configuration complete${NC}\n\n"
 
     # Display token BEFORE launching Explorer
     if [ "$TOKEN" != "$MANUAL_TOKEN_MSG" ]; then
-        printf "┌──────────────────────────────────────────────────────────────────────────────────────────────┐\n"
-        printf "│ ${BOLD}OPERATOR TOKEN${NC}                                                                               │\n"
-        printf "├──────────────────────────────────────────────────────────────────────────────────────────────┤\n"
-        printf "│ %s │\n" "$TOKEN"
-        printf "├──────────────────────────────────────────────────────────────────────────────────────────────┤\n"
-        printf "│ ${RED}IMPORTANT:${NC} Save this token securely. It cannot be retrieved later.                           │\n"
-        printf "└──────────────────────────────────────────────────────────────────────────────────────────────┘\n\n"
+        printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n"
+        printf "${BOLD}OPERATOR TOKEN: Save this token. It will not be shown again.${NC}\n"
+        printf "%s\n" "$TOKEN"
+        printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n\n"
 
         # Now launch Explorer after showing the token
-        printf "${BOLD}Launching Explorer...${NC}\n"
+        printf "${BOLD}Setting up InfluxDB 3 Explorer...${NC}\n"
 
         # Pull Explorer image
-        printf "├─ Pulling Explorer image\n"
-        if docker compose pull influxdb3-explorer >/dev/null 2>&1; then
-            printf "│  ${GREEN}Downloaded successfully${NC}\n"
-        else
-            printf "│  ${YELLOW}Warning: Failed to pull Explorer image${NC}\n"
-            printf "│  Continuing with cached image if available\n"
-        fi
+        pull_docker_image "influxdb3-explorer" "Explorer" "false"
 
         # Configure Explorer (use port 8181 for container-to-container communication)
         configure_explorer_via_file "$TOKEN" "http://${CONTAINER_NAME}:8181" "$SERVER_NAME" "$DOCKER_DIR"
@@ -629,46 +660,21 @@ setup_docker_compose() {
 
         # Wait for Explorer to be ready
         if wait_for_explorer_ready 60; then
-            printf "├─ Opening Explorer in browser\n"
             open_browser_url "http://localhost:${EXPLORER_PORT}/system-overview"
         fi
-        printf "└─${GREEN} Done${NC}\n\n"
     else
         printf "${YELLOW}Create a token manually:${NC}\n"
         printf "  docker exec ${CONTAINER_NAME} influxdb3 create token --admin\n\n"
     fi
 
     # Display success message and access points AFTER Explorer launch
-    printf "${BOLDGREEN}✓ InfluxDB 3 ${EDITION_NAME} with Explorer successfully deployed${NC}\n\n"
+    printf "\n${BOLDGREEN}✓ InfluxDB 3 ${EDITION_NAME} with Explorer successfully deployed${NC}\n\n"
     printf "${BOLD}Access Points:${NC}\n"
     printf "├─ Explorer UI:  ${BLUE}http://localhost:${EXPLORER_PORT}${NC}\n"
     printf "├─ InfluxDB API: ${BLUE}http://localhost:${INFLUXDB_PORT}${NC}\n"
     printf "└─ Install Dir:  ${DIM}%s${NC}\n\n" "$DOCKER_DIR"
 
     return 0
-}
-
-# Function to find available port (for binary installation)
-find_available_port() {
-    show_progress="${1:-true}"
-    lsof_exec=$(command -v lsof) && {
-        while [ -n "$lsof_exec" ] && lsof -i:"$PORT" -t >/dev/null 2>&1; do
-            if [ "$show_progress" = "true" ]; then
-                printf "├─${DIM} Port %s is in use. Finding new port.${NC}\n" "$PORT"
-            fi
-            PORT=$((PORT + 1))
-            if [ "$PORT" -gt 32767 ]; then
-                printf "└─${DIM} Could not find an available port. Aborting.${NC}\n"
-                exit 1
-            fi
-            if ! "$lsof_exec" -i:"$PORT" -t >/dev/null 2>&1; then
-                if [ "$show_progress" = "true" ]; then
-                    printf "└─${DIM} Found an available port: %s${NC}\n" "$PORT"
-                fi
-                break
-            fi
-        done
-    }
 }
 
 # Function to set up Quick Start defaults for both Core and Enterprise
@@ -766,7 +772,7 @@ setup_license_for_quick_start() {
         printf "1) ${GREEN}Trial${NC} ${DIM}- Full features for 30 days (up to 256 cores)${NC}\n"
         printf "2) ${GREEN}Home${NC} ${DIM}- Free for non-commercial use (max 2 cores, single node)${NC}\n"
         echo
-        printf "Enter choice (1-2): "
+        printf "Enter your choice (1-2): "
         read -r LICENSE_CHOICE
 
         case "${LICENSE_CHOICE:-1}" in
@@ -906,23 +912,13 @@ perform_server_health_check() {
 
     if [ $SUCCESS -eq 0 ]; then
         if [ "$is_enterprise" = "true" ]; then
-            printf "└─${BOLD} Error: InfluxDB Enterprise failed to start within %s seconds${NC}\n\n" "$timeout_seconds"
-            if [ "$show_progress" = "true" ]; then
-                printf "${BOLD}This may be due to:${NC}\n"
-                printf "   ├─${YELLOW} Email verification required${NC} ${BOLD}(MOST COMMON ISSUE)${NC}\n"
-                printf "   │  ${BOLD}→ Check your inbox and click the verification link${NC}\n"
-                printf "   ├─ Network connectivity issues during license retrieval\n"
-                printf "   ├─ Invalid license type or email format\n"
-                printf "   ├─ Port %s already in use\n" "$PORT"
-                printf "   └─ Server startup issues\n"
-            else
-                if [ -n "$LICENSE_TYPE" ]; then
-                    printf "   ├─${YELLOW} Check your email for license verification${NC} ${BOLD}(REQUIRED)${NC}\n"
-                    printf "   │  ${BOLD}→ Click the verification link in your inbox${NC}\n"
-                fi
-                printf "   ├─ Network connectivity issues\n"
-                printf "   └─ Port %s conflicts\n" "$PORT"
+            printf "├─${BOLD} Error: InfluxDB Enterprise failed to start within %s seconds${NC}\n\n" "$timeout_seconds"
+            if [ -n "$LICENSE_TYPE" ]; then
+                printf "   ├─${YELLOW} Check your email for license verification${NC} ${BOLD}(REQUIRED)${NC}\n"
+                printf "   │  ${BOLD}→ Click the verification link in your inbox${NC}\n"
             fi
+            printf "   ├─ Check for network connectivity issues\n"
+            printf "   └─ Check for port %s conflicts\n" "$PORT"
 
             # Kill the background process if it's still running
             if kill -0 "$PID" 2>/dev/null; then
@@ -976,6 +972,37 @@ printf "┌───────────────────────
 printf "│ ${BOLD}Welcome to InfluxDB!${NC} We'll make this quick.       │\n"
 printf "└───────────────────────────────────────────────────┘\n"
 
+# Check for edition mismatch
+CURRENT_EDITION=""
+if [ -f "$HOME/.influxdb/docker/docker-compose.yml" ]; then
+    if grep -q "influxdb3-enterprise:" "$HOME/.influxdb/docker/docker-compose.yml" 2>/dev/null; then
+        CURRENT_EDITION="Enterprise"
+    elif grep -q "influxdb3-core:" "$HOME/.influxdb/docker/docker-compose.yml" 2>/dev/null; then
+        CURRENT_EDITION="Core"
+    fi
+elif [ -f "$HOME/.influxdb/influxdb3" ]; then
+    # Binary exists - try to detect edition from binary if possible
+    # For now, we'll need the user to have run it at least once
+    if [ -d "$HOME/.influxdb/data" ]; then
+        # Check for Enterprise-specific license file
+        if find "$HOME/.influxdb/data" -name "trial_or_home_license" 2>/dev/null | grep -q .; then
+            CURRENT_EDITION="Enterprise"
+        else
+            CURRENT_EDITION="Core"
+        fi
+    fi
+fi
+
+# Display notice if trying to install different edition
+if [ -n "$CURRENT_EDITION" ] && [ "$CURRENT_EDITION" != "$EDITION" ]; then
+    printf "\n${YELLOW}Notice:${NC} You have InfluxDB 3 ${BOLD}%s${NC} currently installed, but are installing InfluxDB 3 ${BOLD}%s${NC}.\n" "$CURRENT_EDITION" "$EDITION"
+    if [ "$EDITION" = "Enterprise" ]; then
+        printf "To install %s, remove 'enterprise' as an argument to your script execution command.\n" "$CURRENT_EDITION"
+    else
+        printf "To install %s, add 'enterprise' as an argument to your script execution command.\n" "$CURRENT_EDITION"
+    fi
+fi
+
 printf "\n"
 printf "${BOLD}Select Installation Type${NC}\n"
 printf "\n"
@@ -1000,44 +1027,53 @@ case "$INSTALL_TYPE" in
         
         # Check if directory exists
         if [ -d "$DOCKER_DIR" ] && [ -f "$DOCKER_DIR/docker-compose.yml" ]; then
-            printf "\n${YELLOW}Notice:${NC} Existing installation found at %s\n" "$DOCKER_DIR"
-            printf "\nChoose an option:\n"
-            printf "1) Restart existing setup (keeps data and token)\n"
-            printf "2) Clean install ${DIM}(stops containers, deletes %s directory)${NC}\n" "$DOCKER_DIR"
-            printf "3) Exit\n"
-            printf "Enter choice (1-3): "
-            read -r EXISTING_CHOICE
-            
-            case "$EXISTING_CHOICE" in
-                1)
-                    cd "$DOCKER_DIR"
-                    printf "\nRestarting existing setup...\n"
-                    docker compose down 2>/dev/null || true
-                    sleep 2
-                    docker compose up -d 2>&1 | grep -v "version.*obsolete" | grep -v "Creating$" | grep -v "Created$" | grep -v "Starting$" | grep -v "Started$" | grep -v "Running$" || true
-                    
-                    printf "\n${BOLDGREEN}✓ Setup restarted successfully${NC}\n\n"
-                    printf "${BOLD}Access Points:${NC}\n"
-                    printf "├─ Explorer UI:  ${BLUE}http://localhost:8888${NC}\n"
-                    printf "└─ InfluxDB API: ${BLUE}http://localhost:8181${NC}\n\n"
-                    exit 0
-                    ;;
-                2)
-                    printf "\nPerforming clean install...\n"
-                    cd "$DOCKER_DIR"
-                    docker compose down 2>/dev/null || true
-                    cd ..
-                    rm -rf "$DOCKER_DIR"
-                    ;;
-                3)
-                    printf "Setup cancelled.\n"
-                    exit 0
-                    ;;
-                *)
-                    printf "${RED}Invalid choice.${NC} Setup cancelled.\n"
-                    exit 1
-                    ;;
-            esac
+            printf "\n${YELLOW}Notice:${NC} Existing installation found at %s\n\n" "$DOCKER_DIR"
+            printf "${BOLD}Updating to latest images...${NC}\n"
+
+            cd "$DOCKER_DIR"
+
+            # Detect which InfluxDB service is in the compose file
+            if grep -q "influxdb3-enterprise:" docker-compose.yml; then
+                INFLUXDB_SERVICE="influxdb3-enterprise"
+                EDITION_NAME="Enterprise"
+            else
+                INFLUXDB_SERVICE="influxdb3-core"
+                EDITION_NAME="Core"
+            fi
+
+            # Use existing ports or defaults
+            INFLUXDB_PORT="${EXISTING_INFLUXDB_PORT:-8181}"
+            EXPLORER_PORT="${EXISTING_EXPLORER_PORT:-8888}"
+
+            # Pull latest images
+            pull_docker_image "$INFLUXDB_SERVICE" "InfluxDB 3 ${EDITION_NAME}" "false"
+            pull_docker_image "influxdb3-explorer" "InfluxDB 3 Explorer" "false"
+
+            # Restart with new images
+            printf "├─ Stopping containers\n"
+            docker compose down 2>/dev/null || true
+
+            docker compose up -d "$INFLUXDB_SERVICE" 2>&1 | filter_docker_output
+
+            # Wait for InfluxDB to be ready
+            if ! wait_for_container_ready "$INFLUXDB_SERVICE" "startup time:" 60 "" ""; then
+                printf "\n${RED}Error: InfluxDB failed to start${NC}\n"
+                exit 1
+            fi
+
+            docker compose up -d influxdb3-explorer 2>&1 | filter_docker_output
+
+            # Wait for Explorer to be ready
+            if wait_for_explorer_ready 60; then
+                open_browser_url "http://localhost:${EXPLORER_PORT}/system-overview"
+            fi
+            printf "\n"
+
+            printf "${BOLDGREEN}✓ InfluxDB 3 %s with Explorer updated successfully${NC}\n\n" "$EDITION_NAME"
+            printf "${BOLD}Access Points:${NC}\n"
+            printf "├─ Explorer UI:  ${BLUE}http://localhost:${EXPLORER_PORT}${NC}\n"
+            printf "└─ InfluxDB API: ${BLUE}http://localhost:${INFLUXDB_PORT}${NC}\n\n"
+            exit 0
         fi
         
         # Run appropriate setup based on edition
@@ -1050,37 +1086,7 @@ case "$INSTALL_TYPE" in
         exit 0
         ;;
     2)
-        # Binary installation selected - check for existing binary installation
-        detect_existing_installations
-        if [ "$BINARY_FOUND" = true ]; then
-            printf "\n${YELLOW}Notice:${NC} Existing binary installation found at %s/influxdb3\n" "$INSTALL_LOC"
-            if [ -n "$BINARY_VERSION" ]; then
-                printf "Current version: %s\n" "$BINARY_VERSION"
-                printf "New version: %s\n" "$INFLUXDB_VERSION"
-            fi
-            if [ -n "$BINARY_DATA_SIZE" ]; then
-                printf "Data directory: %s/data (%s) ${GREEN}will be preserved${NC}\n" "$INSTALL_LOC" "$BINARY_DATA_SIZE"
-            fi
-            printf "\nChoose an option:\n"
-            printf "1) Continue installation (upgrade/reinstall, keeps data)\n"
-            printf "2) Exit\n"
-            printf "Enter choice (1-2): "
-            read -r BINARY_EXISTING_CHOICE
-
-            case "$BINARY_EXISTING_CHOICE" in
-                1)
-                    printf "\nProceeding with installation...\n"
-                    ;;
-                2)
-                    printf "Installation cancelled.\n"
-                    exit 0
-                    ;;
-                *)
-                    printf "${RED}Invalid choice.${NC} Installation cancelled.\n"
-                    exit 1
-                    ;;
-            esac
-        fi
+        # Binary installation selected - proceed directly with download
         printf "\n\n"
         ;;
     *)
@@ -1197,7 +1203,7 @@ if [ "${EDITION}" = "Core" ]; then
         prompt_storage_configuration
 
         # Ensure port is available; if not, find a new one.
-        find_available_port
+        PORT=$(find_next_available_port "$PORT")
 
         # Start and give up to 30 seconds to respond
         echo
@@ -1231,7 +1237,7 @@ if [ "${EDITION}" = "Core" ]; then
 
         # Ensure port is available; if not, find a new one.
         ORIGINAL_PORT="$PORT"
-        find_available_port false
+        PORT=$(find_next_available_port "$PORT")
 
         # Show port result
         if [ "$PORT" != "$ORIGINAL_PORT" ]; then
@@ -1279,8 +1285,6 @@ else
             fi
             setup_quick_start_defaults enterprise
             setup_license_for_quick_start
-            STORAGE_FLAGS="--object-store=file --data-dir ${STORAGE_PATH} --plugin-dir ${PLUGIN_PATH}"
-            STORAGE_FLAGS_ECHO="--object-store=file --data-dir ${STORAGE_PATH} --plugin-dir ${PLUGIN_PATH}"
             START_SERVICE="y"
             ;;
         2)
@@ -1315,7 +1319,7 @@ else
 
         # Ensure port is available; if not, find a new one.
         ORIGINAL_PORT="$PORT"
-        find_available_port false
+        PORT=$(find_next_available_port "$PORT")
 
         # Show port result
         if [ "$PORT" != "$ORIGINAL_PORT" ]; then
@@ -1400,7 +1404,7 @@ else
         prompt_storage_configuration
 
         # Ensure port is available; if not, find a new one.
-        find_available_port
+        PORT=$(find_next_available_port "$PORT")
 
         # Start Enterprise in background with licensing and give up to 90 seconds to respond (licensing takes longer)
         echo

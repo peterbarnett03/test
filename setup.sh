@@ -133,7 +133,9 @@
 #
 ################################################################################
 
-# ==========================Script Config==========================
+# ==============================================================================
+# SECTION 1: SCRIPT CONFIGURATION
+# ==============================================================================
 
 readonly GREEN='\033[0;32m'
 readonly BLUE='\033[0;34m'
@@ -167,8 +169,10 @@ INFLUXDB_VERSION="3.6.0"
 EDITION="Core"
 EDITION_TAG="core"
 
+# ==============================================================================
+# SECTION 2: COMMAND LINE ARGUMENT PARSING
+# ==============================================================================
 
-# Parse command line arguments
 while [ $# -gt 0 ]; do
     case "$1" in
         --version)
@@ -181,17 +185,17 @@ while [ $# -gt 0 ]; do
             shift 1
             ;;
         *)
-            echo "Usage: $0 [enterprise] [--version VERSION]"
-            echo "  enterprise: Install the Enterprise edition (optional)"
-            echo "  --version VERSION: Specify InfluxDB version (default: $INFLUXDB_VERSION)"
+            printf "Usage: %s [enterprise] [--version VERSION]\n" "$0"
+            printf "  enterprise: Install the Enterprise edition (optional)\n"
+            printf "  --version VERSION: Specify InfluxDB version (default: %s)\n" "$INFLUXDB_VERSION"
             exit 1
             ;;
     esac
 done
 
-
-
-# ==========================Detect OS/Architecture==========================
+# ==============================================================================
+# SECTION 3: SYSTEM DETECTION
+# ==============================================================================
 
 case "$(uname -s)" in
     Linux*)     OS="Linux";;
@@ -228,20 +232,13 @@ URL="https://dl.influxdata.com/influxdb/releases/influxdb3-${EDITION_TAG}-${INFL
 
 
 
-# ==========================Reusable Script Functions ==========================
+# ==============================================================================
+# SECTION 4: GENERAL UTILITY FUNCTIONS
+# ==============================================================================
+# Cross-cutting utilities used by multiple installation methods
 
-# Function to check if Docker is available and running
-check_docker() {
-    if ! command -v docker >/dev/null 2>&1; then
-        return 1
-    fi
-    if ! docker info >/dev/null 2>&1; then
-        return 1
-    fi
-    return 0
-}
+# --- Port Management ---
 
-# Function to find available ports for InfluxDB and Explorer
 # Find next available port starting from given port
 # Parameters: $1 - starting_port (e.g., 8181)
 # Returns: Available port number (echoes to stdout)
@@ -256,16 +253,57 @@ find_next_available_port() {
     fi
 
     while "$lsof_exec" -i:"$current_port" -t >/dev/null 2>&1; do
-        printf "├─${DIM} Port %s is in use. Finding new port.${NC}\n" "$current_port"
+        printf "├─${DIM} Port %s is in use. Finding new port.${NC}\n" "$current_port" >&2
         current_port=$((current_port + 1))
         if [ "$current_port" -gt 32767 ]; then
-            printf "└─${RED} Could not find an available port. Aborting.${NC}\n"
+            printf "└─${RED} Could not find an available port. Aborting.${NC}\n" >&2
             exit 1
         fi
     done
 
     echo "$current_port"
 }
+
+# --- Browser Integration ---
+
+# Utility function to open URL in browser
+open_browser_url() {
+    URL="$1"
+    if command -v open >/dev/null 2>&1; then
+        open "$URL" >/dev/null 2>&1 &
+    elif command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$URL" >/dev/null 2>&1 &
+    elif command -v start >/dev/null 2>&1; then
+        start "$URL" >/dev/null 2>&1 &
+    fi
+}
+
+# --- Security Utilities ---
+
+# Utility function to generate session secret
+generate_session_secret() {
+    openssl rand -hex 32 2>/dev/null || date +%s | sha256sum | head -c 32
+}
+
+# ==============================================================================
+# SECTION 5: DOCKER COMPOSE UTILITIES
+# ==============================================================================
+# Docker-specific operations and helpers
+
+# --- Docker Validation ---
+
+# Function to check if Docker is available and running
+check_docker() {
+    if ! command -v docker >/dev/null 2>&1; then
+        return 1
+    fi
+    if ! docker info >/dev/null 2>&1; then
+        return 1
+    fi
+    return 0
+}
+
+# --- Image Management ---
 
 # Pull Docker Compose image with configurable error handling
 # Parameters:
@@ -280,14 +318,42 @@ pull_docker_image() {
 
     printf "├─ Pulling %s image..." "$display_name"
 
-    if docker compose pull "$service_name" >/dev/null 2>&1; then
+    # Capture error output
+    PULL_OUTPUT=$(docker compose pull "$service_name" 2>&1)
+    PULL_EXIT_CODE=$?
+
+    if [ $PULL_EXIT_CODE -eq 0 ]; then
         printf "SUCCESS\n"
         return 0
     else
         if [ "$is_fatal" = "true" ]; then
             printf "${RED}FAILED${NC}\n"
             printf "└─ ${RED}Error: Failed to pull %s image${NC}\n" "$display_name"
-            printf "   Check your internet connection and Docker Hub access\n\n"
+
+            # Display actual error with context
+            printf "\n${BOLD}Error details:${NC}\n"
+            printf "%s\n\n" "$PULL_OUTPUT"
+
+            # Provide specific troubleshooting based on error content
+            printf "${BOLD}Possible causes:${NC}\n"
+            if echo "$PULL_OUTPUT" | grep -qi "denied\|unauthorized"; then
+                printf "  • Docker Hub authentication required or rate limited\n"
+                printf "  • Try: docker login\n"
+            elif echo "$PULL_OUTPUT" | grep -qi "network\|timeout\|connection"; then
+                printf "  • Network connectivity issue\n"
+                printf "  • Check your internet connection\n"
+            elif echo "$PULL_OUTPUT" | grep -qi "daemon"; then
+                printf "  • Docker daemon may not be responding\n"
+                printf "  • Try: docker info\n"
+            elif echo "$PULL_OUTPUT" | grep -qi "yaml\|control characters"; then
+                printf "  • Invalid YAML syntax in docker-compose.yml\n"
+                printf "  • Inspect file: cat %s/docker-compose.yml\n" "$DOCKER_DIR"
+            else
+                printf "  • Check Docker daemon status: docker info\n"
+                printf "  • Check internet connection\n"
+                printf "  • Check Docker Hub access\n"
+            fi
+            printf "\n"
             return 1
         else
             printf "${YELLOW}FAILED${NC}\n"
@@ -298,29 +364,24 @@ pull_docker_image() {
     fi
 }
 
+# --- Output Formatting ---
+
 # Utility function to filter Docker Compose output
 filter_docker_output() {
     eval "$DOCKER_OUTPUT_FILTER" || true
 }
 
-# Utility function to open URL in browser
-open_browser_url() {
-    URL="$1"
-    if command -v open >/dev/null 2>&1; then
-        open "$URL" >/dev/null 2>&1 &
-    elif command -v xdg-open >/dev/null 2>&1; then
-        xdg-open "$URL" >/dev/null 2>&1 &
-    elif command -v start >/dev/null 2>&1; then
-        start "$URL" >/dev/null 2>&1 &
-    fi
-}
+# --- Filesystem Setup ---
 
 # Utility function to create docker directories with permissions
 create_docker_directories() {
     DOCKER_DIR="$1"
 
-    mkdir -p "$DOCKER_DIR/influxdb3/data"
-    mkdir -p "$DOCKER_DIR/influxdb3/plugins"
+    # Create shared data directories (used by both Docker and binary)
+    mkdir -p "$HOME/.influxdb/data"
+    mkdir -p "$HOME/.influxdb/plugins"
+
+    # Create Docker-specific directories
     mkdir -p "$DOCKER_DIR/explorer/db"
     mkdir -p "$DOCKER_DIR/explorer/config"
 
@@ -328,10 +389,7 @@ create_docker_directories() {
     chmod 755 "$DOCKER_DIR/explorer/config" 2>/dev/null || true
 }
 
-# Utility function to generate session secret
-generate_session_secret() {
-    openssl rand -hex 32 2>/dev/null || date +%s | sha256sum | head -c 32
-}
+# --- Health Checks ---
 
 # Utility function to wait for container to be ready
 wait_for_container_ready() {
@@ -404,18 +462,33 @@ wait_for_explorer_ready() {
     return 1
 }
 
+# --- Token Management ---
+
 # Utility function to create operator token via API
 create_operator_token() {
     CONTAINER_NAME="$1"
 
-    # Try API first with retries
+    # Try API with retries
     MAX_RETRIES=3
     RETRY=0
     TOKEN=""
 
     while [ $RETRY -lt $MAX_RETRIES ] && [ -z "$TOKEN" ]; do
-        TOKEN_RESPONSE=$(curl -s -m 5 -X POST http://localhost:$INFLUXDB_PORT/api/v3/configure/token/admin 2>&1)
-        TOKEN=$(echo "$TOKEN_RESPONSE" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+        TOKEN_RESPONSE=$(curl -s -w "\n%{http_code}" -m 5 -X POST http://localhost:$INFLUXDB_PORT/api/v3/configure/token/admin 2>&1)
+
+        # Extract HTTP status code (last line)
+        HTTP_CODE=$(echo "$TOKEN_RESPONSE" | tail -n1)
+        # Extract response body (all but last line)
+        RESPONSE_BODY=$(echo "$TOKEN_RESPONSE" | sed '$d')
+
+        # Check for 409 conflict
+        if [ "$HTTP_CODE" = "409" ]; then
+            echo "TOKEN_ALREADY_EXISTS"
+            return 2
+        fi
+
+        # Try to extract token from response
+        TOKEN=$(echo "$RESPONSE_BODY" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
 
         if [ -z "$TOKEN" ] && [ $RETRY -lt $((MAX_RETRIES - 1)) ]; then
             sleep 2
@@ -425,20 +498,17 @@ create_operator_token() {
         fi
     done
 
-    # Fallback to CLI if API fails
-    if [ -z "$TOKEN" ]; then
-        TOKEN_OUTPUT=$(docker exec "$CONTAINER_NAME" influxdb3 create token --admin 2>&1)
-        TOKEN=$(echo "$TOKEN_OUTPUT" | grep -oE '(apiv3|idb3)_[a-zA-Z0-9_-]+' | head -1)
-
-        if [ -z "$TOKEN" ]; then
-            echo "$MANUAL_TOKEN_MSG"
-            return 1
-        fi
+    # Return token or manual creation message
+    if [ -n "$TOKEN" ]; then
+        echo "$TOKEN"
+        return 0
+    else
+        echo "$MANUAL_TOKEN_MSG"
+        return 1
     fi
-
-    echo "$TOKEN"
-    return 0
 }
+
+# --- Configuration Generation ---
 
 # Function to generate Docker Compose YAML
 generate_docker_compose_yaml() {
@@ -563,6 +633,11 @@ extract_token_from_explorer_config() {
     return 1
 }
 
+# ==============================================================================
+# SECTION 6: DOCKER COMPOSE ORCHESTRATION
+# ==============================================================================
+# High-level Docker Compose setup workflow
+
 # Unified function to setup Docker Compose (both Core and Enterprise)
 setup_docker_compose() {
     EDITION_TYPE="$1"  # "core" or "enterprise"
@@ -686,7 +761,7 @@ setup_docker_compose() {
     fi
 
     # Display token BEFORE launching Explorer (only if newly created)
-    if [ "$TOKEN" != "$MANUAL_TOKEN_MSG" ]; then
+    if [ "$TOKEN" != "$MANUAL_TOKEN_MSG" ] && [ "$TOKEN" != "TOKEN_ALREADY_EXISTS" ]; then
         if [ "$TOKEN_IS_NEW" = true ]; then
             printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n"
             printf "${BOLD}OPERATOR TOKEN: Save this token. It will not be shown again.${NC}\n"
@@ -709,8 +784,17 @@ setup_docker_compose() {
             open_browser_url "http://localhost:${EXPLORER_PORT}/system-overview"
         fi
     else
-        printf "${YELLOW}Create a token manually:${NC}\n"
-        printf "  docker exec ${CONTAINER_NAME} influxdb3 create token --admin\n\n"
+        if [ "$TOKEN" = "TOKEN_ALREADY_EXISTS" ]; then
+            printf "${YELLOW}An admin token already exists in the database${NC}\n\n"
+            printf "${BOLD}To complete setup:${NC}\n"
+            printf "1. Add your existing token to: %s/explorer/config/config.json\n" "$DOCKER_DIR"
+            printf "   Edit the file and set \"DEFAULT_API_TOKEN\" to your token value\n\n"
+            printf "2. Start Explorer:\n"
+            printf "   cd %s && docker compose up -d influxdb3-explorer\n\n" "$DOCKER_DIR"
+        else
+            printf "${YELLOW}Create a token manually:${NC}\n"
+            printf "  docker exec ${CONTAINER_NAME} influxdb3 create token --admin\n\n"
+        fi
     fi
 
     # Display success message and access points AFTER Explorer launch
@@ -722,6 +806,13 @@ setup_docker_compose() {
 
     return 0
 }
+
+# ==============================================================================
+# SECTION 7: BINARY INSTALLATION UTILITIES
+# ==============================================================================
+# Low-level binary installation helpers
+
+# --- Quick Start Configuration ---
 
 # Function to set up Quick Start defaults for both Core and Enterprise
 setup_quick_start_defaults() {
@@ -746,9 +837,11 @@ setup_quick_start_defaults() {
     mkdir -p "${PLUGIN_PATH}"
 }
 
+# --- Cloud Storage Configuration ---
+
 # Function to configure AWS S3 storage
 configure_aws_s3_storage() {
-    echo
+    printf "\n"
     printf "${BOLD}AWS S3 Configuration${NC}\n"
     printf "├─ Enter AWS Access Key ID: "
     read -r AWS_KEY
@@ -758,7 +851,7 @@ configure_aws_s3_storage() {
     read -r AWS_SECRET
     stty echo
 
-    echo
+    printf "\n"
     printf "├─ Enter S3 Bucket: "
     read -r AWS_BUCKET
 
@@ -777,7 +870,7 @@ configure_aws_s3_storage() {
 
 # Function to configure Azure storage
 configure_azure_storage() {
-    echo
+    printf "\n"
     printf "${BOLD}Azure Storage Configuration${NC}\n"
     printf "├─ Enter Storage Account Name: "
     read -r AZURE_ACCOUNT
@@ -787,7 +880,7 @@ configure_azure_storage() {
     read -r AZURE_KEY
     stty echo
 
-    echo
+    printf "\n"
     STORAGE_FLAGS="--object-store=azure --azure-storage-account=${AZURE_ACCOUNT}"
     STORAGE_FLAGS_ECHO="$STORAGE_FLAGS --azure-storage-access-key=..."
     STORAGE_FLAGS="$STORAGE_FLAGS --azure-storage-access-key=${AZURE_KEY}"
@@ -795,13 +888,15 @@ configure_azure_storage() {
 
 # Function to configure Google Cloud storage
 configure_google_cloud_storage() {
-    echo
+    printf "\n"
     printf "${BOLD}Google Cloud Storage Configuration${NC}\n"
     printf "└─ Enter path to service account JSON file: "
     read -r GOOGLE_SA
     STORAGE_FLAGS="--object-store=google --google-service-account=${GOOGLE_SA}"
     STORAGE_FLAGS_ECHO="$STORAGE_FLAGS"
 }
+
+# --- Enterprise License ---
 
 # Function to set up license for Enterprise Quick Start
 setup_license_for_quick_start() {
@@ -813,11 +908,11 @@ setup_license_for_quick_start() {
         LICENSE_DESC="Existing"
     else
         # Prompt for license type and email only
-        echo
+        printf "\n"
         printf "${BOLD}License Setup Required${NC}\n"
         printf "1) ${GREEN}Trial${NC} ${DIM}- Full features for 30 days (up to 256 cores)${NC}\n"
         printf "2) ${GREEN}Home${NC} ${DIM}- Free for non-commercial use (max 2 cores, single node)${NC}\n"
-        echo
+        printf "\n"
         printf "Enter your choice (1-2): "
         read -r LICENSE_CHOICE
 
@@ -845,10 +940,12 @@ setup_license_for_quick_start() {
     fi
 }
 
+# --- Storage Configuration Prompts ---
+
 # Function to prompt for storage configuration
 prompt_storage_configuration() {
     # Prompt for storage solution
-    echo
+    printf "\n"
     printf "${BOLD}Select Your Storage Solution${NC}\n"
     printf "├─ 1) File storage (Persistent)\n"
     printf "├─ 2) Object storage (Persistent)\n"
@@ -859,7 +956,7 @@ prompt_storage_configuration() {
     case "$STORAGE_CHOICE" in
         1)
             STORAGE_TYPE="File Storage"
-            echo
+            printf "\n"
             printf "Enter storage path (default: %s/data): " "${INSTALL_LOC}"
             read -r STORAGE_PATH
             STORAGE_PATH=${STORAGE_PATH:-"$INSTALL_LOC/data"}
@@ -868,7 +965,7 @@ prompt_storage_configuration() {
             ;;
         2)
             STORAGE_TYPE="Object Storage"
-            echo
+            printf "\n"
             printf "${BOLD}Select Cloud Provider${NC}\n"
             printf "├─ 1) Amazon S3\n"
             printf "├─ 2) Azure Storage\n"
@@ -911,6 +1008,8 @@ prompt_storage_configuration() {
             ;;
     esac
 }
+
+# --- Server Management ---
 
 # Function to perform health check on server
 perform_server_health_check() {
@@ -994,7 +1093,7 @@ display_enterprise_server_command() {
         fi
         printf "${DIM}   --http-bind=0.0.0.0:%s \\\\${NC}\n" "$PORT"
         printf "${DIM}   %s${NC}\n" "$STORAGE_FLAGS_ECHO"
-        echo
+        printf "\n"
     else
         # Custom configuration format
         printf "│\n"
@@ -1010,7 +1109,11 @@ display_enterprise_server_command() {
     fi
 }
 
-# =========================Installation==========================
+# ==============================================================================
+# SECTION 8: MAIN INSTALLATION FLOW
+# ==============================================================================
+
+# --- Phase 1: Welcome and Pre-Checks ---
 
 # Attempt to clear screen and show welcome message
 clear 2>/dev/null || true
@@ -1048,6 +1151,8 @@ if [ -n "$CURRENT_EDITION" ] && [ "$CURRENT_EDITION" != "$EDITION" ]; then
         printf "To install %s, add 'enterprise' as an argument to your script execution command.\n" "$CURRENT_EDITION"
     fi
 fi
+
+# --- Phase 2: Installation Type Selection ---
 
 printf "\n"
 printf "${BOLD}Select Installation Type${NC}\n"
@@ -1104,7 +1209,7 @@ mkdir -p "$INSTALL_LOC"
 printf "└─${DIM} curl -sSL '%s' -o '%s/influxdb3-${EDITION_TAG}.tar.gz'${NC}\n" "${URL}" "$INSTALL_LOC"
 curl -sSL "${URL}" -o "$INSTALL_LOC/influxdb3-${EDITION_TAG}.tar.gz"
 
-echo
+printf "\n"
 printf "${BOLD}Verifying '%s/influxdb3-${EDITION_TAG}.tar.gz'${NC}\n" "$INSTALL_LOC"
 printf "└─${DIM} curl -sSL '%s.sha256' -o '%s/influxdb3-${EDITION_TAG}.tar.gz.sha256'${NC}\n" "${URL}" "$INSTALL_LOC"
 curl -sSL "${URL}.sha256" -o "$INSTALL_LOC/influxdb3-${EDITION_TAG}.tar.gz.sha256"
@@ -1146,7 +1251,7 @@ printf "└─${DIM} rm '%s/influxdb3-${EDITION_TAG}.tar.gz'${NC}\n" "$INSTALL_L
 rm "$INSTALL_LOC/influxdb3-${EDITION_TAG}.tar.gz"
 
 if [ -n "$shellrc" ] && ! grep -q "export PATH=.*$INSTALL_LOC" "$shellrc"; then
-    echo
+    printf "\n"
     printf "${BOLD}Adding InfluxDB to '%s'${NC}\n" "$shellrc"
     printf "└─${DIM} export PATH=\"\$PATH:%s/\" >> '%s'${NC}\n" "$INSTALL_LOC" "$shellrc"
     echo "export PATH=\"\$PATH:$INSTALL_LOC/\"" >> "$shellrc"
@@ -1156,12 +1261,12 @@ export INFLUXDB3_SERVE_INVOCATION_METHOD="install-script"
 
 if [ "${EDITION}" = "Core" ]; then
     # Prompt user for startup options
-    echo
+    printf "\n"
     printf "${BOLD}What would you like to do next?${NC}\n"
     printf "1) ${GREEN}Quick Start${NC} ${DIM}(recommended; data stored at %s/data)${NC}\n" "${INSTALL_LOC}"
     printf "2) ${GREEN}Custom Configuration${NC} ${DIM}(configure all options manually)${NC}\n"
     printf "3) ${GREEN}Skip startup${NC} ${DIM}(install only)${NC}\n"
-    echo
+    printf "\n"
     printf "Enter your choice (1-3): "
     read -r STARTUP_CHOICE
     STARTUP_CHOICE=${STARTUP_CHOICE:-1}
@@ -1187,7 +1292,7 @@ if [ "${EDITION}" = "Core" ]; then
 
     if [ "$START_SERVICE" = "y" ] && [ "$STARTUP_CHOICE" = "2" ]; then
         # Prompt for Node ID
-        echo
+        printf "\n"
         printf "${BOLD}Enter Your Node ID${NC}\n"
         printf "├─ A Node ID is a unique, uneditable identifier for a service.\n"
         printf "└─ Enter a Node ID (default: node0): "
@@ -1201,7 +1306,7 @@ if [ "${EDITION}" = "Core" ]; then
         PORT=$(find_next_available_port "$PORT")
 
         # Start and give up to 30 seconds to respond
-        echo
+        printf "\n"
 
         # Create logs directory and generate timestamped log filename
         mkdir -p "$INSTALL_LOC/logs"
@@ -1223,7 +1328,7 @@ if [ "${EDITION}" = "Core" ]; then
 
     elif [ "$START_SERVICE" = "y" ] && [ "$STARTUP_CHOICE" = "1" ]; then
         # Quick Start flow - minimal output, just start the server
-        echo
+        printf "\n"
         printf "${BOLD}Starting InfluxDB (Quick Start)${NC}\n"
         printf "├─${DIM} Node ID: %s${NC}\n" "$NODE_ID"
         printf "├─${DIM} Storage: %s/data${NC}\n" "${INSTALL_LOC}"
@@ -1257,17 +1362,17 @@ if [ "${EDITION}" = "Core" ]; then
         perform_server_health_check 30
 
     else
-        echo
+        printf "\n"
         printf "${BOLDGREEN}✓ InfluxDB 3 ${EDITION} is now installed. Nice!${NC}\n"
     fi
 else
     # Enterprise startup options
-    echo
+    printf "\n"
     printf "${BOLD}What would you like to do next?${NC}\n"
     printf "1) ${GREEN}Quick Start${NC} ${DIM}(recommended; data stored at %s/data)${NC}\n" "${INSTALL_LOC}"
     printf "2) ${GREEN}Custom Configuration${NC} ${DIM}(configure all options manually)${NC}\n"
     printf "3) ${GREEN}Skip startup${NC} ${DIM}(install only)${NC}\n"
-    echo
+    printf "\n"
     printf "Enter your choice (1-3): "
     read -r STARTUP_CHOICE
     STARTUP_CHOICE=${STARTUP_CHOICE:-1}
@@ -1294,7 +1399,7 @@ else
 
     if [ "$START_SERVICE" = "y" ] && [ "$STARTUP_CHOICE" = "1" ]; then
         # Enterprise Quick Start flow
-        echo
+        printf "\n"
         printf "${BOLD}Starting InfluxDB Enterprise (Quick Start)${NC}\n"
         printf "├─${DIM} Cluster ID: %s${NC}\n" "$CLUSTER_ID"
         printf "├─${DIM} Node ID: %s${NC}\n" "$NODE_ID"
@@ -1340,7 +1445,7 @@ else
 
     elif [ "$START_SERVICE" = "y" ] && [ "$STARTUP_CHOICE" = "2" ]; then
         # Enterprise Custom Start flow
-        echo
+        printf "\n"
         # Prompt for Cluster ID
         printf "${BOLD}Enter Your Cluster ID${NC}\n"
         printf "├─ A Cluster ID determines part of the storage path hierarchy.\n"
@@ -1350,7 +1455,7 @@ else
         CLUSTER_ID=${CLUSTER_ID:-cluster0}
 
         # Prompt for Node ID
-        echo
+        printf "\n"
         printf "${BOLD}Enter Your Node ID${NC}\n"
         printf "├─ A Node ID distinguishes individual server instances within the cluster.\n"
         printf "└─ Enter a Node ID (default: node0): "
@@ -1358,7 +1463,7 @@ else
         NODE_ID=${NODE_ID:-node0}
 
         # Prompt for license type
-        echo
+        printf "\n"
         printf "${BOLD}Select Your License Type${NC}\n"
         printf "├─ 1) Trial - Full features for 30 days (up to 256 cores)\n"
         printf "├─ 2) Home - Free for non-commercial use (max 2 cores, single node)\n"
@@ -1382,7 +1487,7 @@ else
         esac
 
         # Prompt for email
-        echo
+        printf "\n"
         printf "${BOLD}Enter Your Email Address${NC}\n"
         printf "├─ Required for license verification and activation\n"
         printf "├─${YELLOW} IMPORTANT: You MUST verify your email to activate the license${NC}\n"
@@ -1402,7 +1507,7 @@ else
         PORT=$(find_next_available_port "$PORT")
 
         # Start Enterprise in background with licensing and give up to 90 seconds to respond (licensing takes longer)
-        echo
+        printf "\n"
         printf "${BOLD}Starting InfluxDB Enterprise${NC}\n"
         printf "├─${DIM} Cluster ID: %s${NC}\n" "$CLUSTER_ID"
         printf "├─${DIM} Node ID: %s${NC}\n" "$NODE_ID"
@@ -1426,7 +1531,7 @@ else
         perform_server_health_check 90 true
 
     else
-        echo
+        printf "\n"
         printf "${BOLDGREEN}✓ InfluxDB 3 ${EDITION} is now installed. Nice!${NC}\n"
     fi
 fi

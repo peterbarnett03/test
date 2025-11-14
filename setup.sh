@@ -606,7 +606,6 @@ configure_explorer_via_file() {
     cat > "$DOCKER_DIR/explorer/config/config.json" <<EOF
 {
   "DEFAULT_INFLUX_SERVER": "$INFLUXDB_URL",
-  "DEFAULT_INFLUX_DATABASE": "mydb",
   "DEFAULT_API_TOKEN": "$TOKEN",
   "DEFAULT_SERVER_NAME": "$SERVER_NAME"
 }
@@ -739,6 +738,7 @@ setup_docker_compose() {
     # Check for existing token in Explorer config, or create new one
     CONFIG_FILE="$DOCKER_DIR/explorer/config/config.json"
     TOKEN_IS_NEW=false
+    EXPLORER_DEPLOYED=false
 
     if [ -f "$CONFIG_FILE" ]; then
         printf "└─ Found existing Explorer config\n\n"
@@ -773,7 +773,7 @@ setup_docker_compose() {
         printf "${BOLD}Setting up InfluxDB 3 Explorer...${NC}\n"
 
         # Pull Explorer image
-        pull_docker_image "influxdb3-explorer" "Explorer" "false"
+        pull_docker_image "influxdb3-explorer" "InfluxDB 3 Explorer" "false"
 
         # Configure Explorer (use port 8181 for container-to-container communication)
         configure_explorer_via_file "$TOKEN" "http://${CONTAINER_NAME}:8181" "$SERVER_NAME" "$DOCKER_DIR"
@@ -781,28 +781,56 @@ setup_docker_compose() {
 
         # Wait for Explorer to be ready
         if wait_for_explorer_ready 60; then
+            EXPLORER_DEPLOYED=true
             open_browser_url "http://localhost:${EXPLORER_PORT}/system-overview"
         fi
     else
-        if [ "$TOKEN" = "TOKEN_ALREADY_EXISTS" ]; then
-            printf "${YELLOW}An admin token already exists in the database${NC}\n\n"
-            printf "${BOLD}To complete setup:${NC}\n"
-            printf "1. Add your existing token to: %s/explorer/config/config.json\n" "$DOCKER_DIR"
-            printf "   Edit the file and set \"DEFAULT_API_TOKEN\" to your token value\n\n"
-            printf "2. Start Explorer:\n"
-            printf "   cd %s && docker compose up -d influxdb3-explorer\n\n" "$DOCKER_DIR"
-        else
-            printf "${YELLOW}Create a token manually:${NC}\n"
-            printf "  docker exec ${CONTAINER_NAME} influxdb3 create token --admin\n\n"
-        fi
+        # Token creation failed - prepare Explorer but don't start it
+        printf "${BOLD}Setting up InfluxDB 3 Explorer...${NC}\n"
+
+        # Pull Explorer image
+        pull_docker_image "influxdb3-explorer" "InfluxDB 3 Explorer" "false"
+
+        # Configure Explorer with placeholder token
+        configure_explorer_via_file "YOUR_TOKEN_HERE" "http://${CONTAINER_NAME}:8181" "$SERVER_NAME" "$DOCKER_DIR"
+
+        printf "└─ Explorer prepared (manual token configuration required)\n\n"
     fi
 
     # Display success message and access points AFTER Explorer launch
-    printf "\n${BOLDGREEN}✓ InfluxDB 3 ${EDITION_NAME} with Explorer successfully deployed${NC}\n\n"
+    if [ "$EXPLORER_DEPLOYED" = true ]; then
+        printf "\n${BOLDGREEN}✓ InfluxDB 3 ${EDITION_NAME} with InfluxDB 3 Explorer successfully deployed${NC}\n\n"
+    else
+        printf "\n${BOLDGREEN}✓ InfluxDB 3 ${EDITION_NAME} successfully deployed${NC}\n\n"
+    fi
     printf "${BOLD}Access Points:${NC}\n"
-    printf "├─ Explorer UI:  ${BLUE}http://localhost:${EXPLORER_PORT}${NC}\n"
-    printf "├─ InfluxDB API: ${BLUE}http://localhost:${INFLUXDB_PORT}${NC}\n"
-    printf "└─ Install Dir:  ${DIM}%s${NC}\n\n" "$DOCKER_DIR"
+    if [ "$EXPLORER_DEPLOYED" = true ]; then
+        printf "├─ Explorer UI:  ${BLUE}http://localhost:${EXPLORER_PORT}${NC}\n"
+    fi
+    printf "└─ InfluxDB API: ${BLUE}http://localhost:${INFLUXDB_PORT}${NC}\n\n"
+
+    printf "${BOLD}Storage Locations:${NC}\n"
+    printf "├─ InfluxDB Data:    ${DIM}%s/.influxdb/data${NC}\n" "$HOME"
+    if [ "$EXPLORER_DEPLOYED" = true ]; then
+        printf "├─ InfluxDB Plugins: ${DIM}%s/.influxdb/plugins${NC}\n" "$HOME"
+        printf "└─ Explorer DB:      ${DIM}%s/explorer/db${NC}\n\n" "$DOCKER_DIR"
+    else
+        printf "└─ InfluxDB Plugins: ${DIM}%s/.influxdb/plugins${NC}\n\n" "$HOME"
+    fi
+
+    printf "${BOLD}Configuration Files:${NC}\n"
+    printf "├─ Docker Compose:   ${DIM}%s/docker-compose.yml${NC}\n" "$DOCKER_DIR"
+    printf "└─ Explorer Config:  ${DIM}%s/explorer/config/config.json${NC}\n\n" "$DOCKER_DIR"
+
+    # Show manual setup instructions if Explorer was not deployed
+    if [ "$EXPLORER_DEPLOYED" = false ]; then
+        printf "${BOLD}To Complete InfluxDB 3 Explorer Setup:${NC}\n"
+        printf "1. Replace ${DIM}\"YOUR_TOKEN_HERE\"${NC} with your admin token in the Explorer config file:\n"
+        printf "   ${DIM}%s/explorer/config/config.json${NC}\n\n" "$DOCKER_DIR"
+        printf "2. Start InfluxDB 3 Explorer:\n"
+        printf "   ${DIM}cd %s && docker compose up -d influxdb3-explorer${NC}\n\n" "$DOCKER_DIR"
+        printf "3. Open your browser to http://localhost:${EXPLORER_PORT}\n\n"
+    fi
 
     return 0
 }

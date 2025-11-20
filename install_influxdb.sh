@@ -399,9 +399,6 @@ create_docker_directories() {
     mkdir -p "$HOME/.influxdb/data"
     mkdir -p "$HOME/.influxdb/plugins"
 
-    chmod -R 777 "$HOME/.influxdb/data"
-    chmod -R 777 "$HOME/.influxdb/plugins"
-
     # Create Docker-specific directories
     mkdir -p "$DOCKER_DIR/explorer/db"
     mkdir -p "$DOCKER_DIR/explorer/config"
@@ -538,6 +535,9 @@ generate_docker_compose_yaml() {
     LICENSE_EMAIL="$3"
     DOCKER_DIR="$4"
 
+    USER_UID=$(id -u)
+    USER_GID=$(id -g)
+
     # Determine edition-specific values
     if [ "$EDITION_TYPE" = "enterprise" ]; then
         SERVICE_NAME="influxdb3-enterprise"
@@ -557,6 +557,7 @@ services:
   ${SERVICE_NAME}:
     image: ${IMAGE_NAME}
     container_name: ${SERVICE_NAME}
+    user: "${USER_UID}:${USER_GID}"
     ports:
       - "${INFLUXDB_PORT}:8181"
     command:

@@ -399,8 +399,8 @@ create_docker_directories() {
     mkdir -p "$HOME/.influxdb/data"
     mkdir -p "$HOME/.influxdb/plugins"
 
-    chmod -R 700 "$HOME/.influxdb/data"
-    chmod -R 700 "$HOME/.influxdb/plugins"
+    chmod -R 777 "$HOME/.influxdb/data"
+    chmod -R 777 "$HOME/.influxdb/plugins"
 
     # Create Docker-specific directories
     mkdir -p "$DOCKER_DIR/explorer/db"

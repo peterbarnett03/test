@@ -399,6 +399,9 @@ create_docker_directories() {
     mkdir -p "$HOME/.influxdb/data"
     mkdir -p "$HOME/.influxdb/plugins"
 
+    chmod -R 700 "$HOME/.influxdb/data"
+    chmod -R 700 "$HOME/.influxdb/plugins"
+
     # Create Docker-specific directories
     mkdir -p "$DOCKER_DIR/explorer/db"
     mkdir -p "$DOCKER_DIR/explorer/config"
@@ -1214,7 +1217,7 @@ case "$INSTALL_TYPE" in
     1)
         # Docker Compose installation
         if ! check_docker; then
-            printf "\n${RED}Error:${NC} Docker is not installed or not running.\n"
+            printf "\n${RED}Error:${NC} Docker is not installed or not running, or you are not in the Docker user group.\n"
             printf "Please install Docker Desktop or Docker Engine with the compose plugin and try again.\n"
             printf "Visit: ${BLUE}https://www.docker.com/${NC}\n\n"
             exit 1
